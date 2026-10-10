@@ -1,0 +1,41 @@
+PASS lost commit recovers once
+PASS normal native reinsertion does not duplicate
+PASS plain Enter repairs before newline
+PASS CR commit replacing observed Hangul preserves preedit
+PASS CR commit without observed Hangul does not invent a recovery
+PASS LF repairs before newline
+PASS plain Enter carrying native Hangul does not duplicate
+PASS commit on return from another window followed by Enter
+PASS arrow 16777219
+PASS arrow 16777220
+PASS arrow 16777217
+PASS arrow 16777218
+PASS smartEnter repairs before existing command
+PASS Shift modifier does not consume candidate
+PASS focus loss restores without stealing focus
+PASS focus loss finishes observed preedit without changing text
+PASS shell deactivation finishes preedit without stealing focus
+PASS ordinary Backspace is respected
+PASS intentional delete after commit is not undone
+PASS composition duplicate Backspace is suppressed
+PASS Escape invalidates a pending recovery
+PASS late IME completion is bound to old editor
+PASS same-length unrelated edit cancels recovery
+PASS Verify rejection leaves caret untouched
+PASS new editor input cancels recovery
+PASS disposed editor cancels queued work
+PASS read-only widget does not get recovery
+PASS selection is not collapsed
+PASS CRLF preserved
+PASS later MouseUp retains clicked caret after audit
+PASS new input cancels old click receipt
+PASS new caret cancels old click receipt
+PASS Verify transformed insertion is not retried
+PASS visible region offsets are mapped
+PASS another widget key does not discard owner candidate
+PASS block selection declines recovery
+PASS duplicate installer does not double recover
+PASS repair supports Undo Redo round trip
+PASS generic StyledText legacy arrow fallback
+PASS close removes command listener
+PASS 40 integration scenarios (synthetic IME protocol)

@@ -1,6 +1,6 @@
 # Eclipse macOS 한글 입력 보정 플러그인
 
-**버전: 1.0.0**
+**버전: 1.0.1**
 
 macOS의 Eclipse 편집기에서 한글을 입력할 때 조합 중인 글자가 사라지거나 앞 글자까지 지워지는 문제를 줄이는 플러그인입니다.
 
@@ -29,7 +29,7 @@ macOS의 Eclipse 편집기에서 한글을 입력할 때 조합 중인 글자가
 
 ## 설치하기
 
-1. GitHub 저장소의 **Releases**에서 `eclipse.macos.koreanime.styledtext.fix_1.0.0.jar`를 내려받습니다. 소스에서 직접 빌드한 경우 `dist/`에 같은 파일이 생성됩니다.
+1. GitHub 저장소의 **Releases**에서 `eclipse.macos.koreanime.styledtext.fix_1.0.1.jar`를 내려받습니다. 소스에서 직접 빌드한 경우 `dist/`에 같은 파일이 생성됩니다.
 2. Eclipse를 종료합니다.
 3. 설치할 Eclipse의 `dropins` 폴더에 JAR를 넣습니다. macOS Eclipse JEE의 예시는 `/Applications/Eclipse JEE.app/Contents/Eclipse/dropins/`입니다. 설치 위치나 앱 이름이 다르면 경로를 맞춰 주세요.
 4. 같은 입력 오류를 고치는 플러그인이 중복 실행되지 않게 확인하고 Eclipse를 다시 실행합니다.
@@ -62,11 +62,11 @@ python3 build.py --eclipse "/Applications/Eclipse.app/Contents/Eclipse"
 python3 test.py --eclipse "/Applications/Eclipse.app/Contents/Eclipse"
 ```
 
-빌드 결과는 `dist/eclipse.macos.koreanime.styledtext.fix_1.0.0.jar`입니다. 테스트는 별도 SWT 창을 열어 합성 IME 프로토콜을 검사합니다. 실제 키보드 검사는 위의 항목을 직접 확인해야 합니다.
+빌드 결과는 `dist/eclipse.macos.koreanime.styledtext.fix_1.0.1.jar`입니다. 테스트는 별도 SWT 창을 열어 합성 IME 프로토콜을 검사합니다. 실제 키보드 검사는 위의 항목을 직접 확인해야 합니다.
 
 ## 제거하기
 
-Eclipse를 종료하고 `dropins`의 `eclipse.macos.koreanime.styledtext.fix_1.0.0.jar`를 제거한 뒤 다시 실행합니다.
+Eclipse를 종료하고 `dropins`의 `eclipse.macos.koreanime.styledtext.fix_1.0.1.jar`를 제거한 뒤 다시 실행합니다.
 
 ## 라이선스
 

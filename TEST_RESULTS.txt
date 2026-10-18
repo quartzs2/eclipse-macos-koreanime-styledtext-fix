@@ -29,6 +29,9 @@ PASS selection is not collapsed
 PASS CRLF preserved
 PASS later MouseUp retains clicked caret after audit
 PASS new input cancels old click receipt
+PASS MouseUp before audit restores text and clicked caret
+PASS new key cancels queued clicked caret
+PASS new selection cancels queued clicked caret
 PASS new caret cancels old click receipt
 PASS Verify transformed insertion is not retried
 PASS visible region offsets are mapped
@@ -38,4 +41,4 @@ PASS duplicate installer does not double recover
 PASS repair supports Undo Redo round trip
 PASS generic StyledText legacy arrow fallback
 PASS close removes command listener
-PASS 40 integration scenarios (synthetic IME protocol)
+PASS 43 integration scenarios (synthetic IME protocol)

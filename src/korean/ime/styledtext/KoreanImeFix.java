@@ -3,478 +3,998 @@ package korean.ime.styledtext;
 import java.util.ArrayDeque;
 import java.util.IdentityHashMap;
 import java.util.Map;
-import org.eclipse.core.commands.*;
-import org.eclipse.jface.text.*;
+import org.eclipse.core.commands.ExecutionEvent;
+import org.eclipse.core.commands.ExecutionException;
+import org.eclipse.core.commands.IExecutionListener;
+import org.eclipse.core.commands.NotHandledException;
+import org.eclipse.jface.text.BadLocationException;
+import org.eclipse.jface.text.DocumentEvent;
+import org.eclipse.jface.text.IDocument;
+import org.eclipse.jface.text.IDocumentListener;
+import org.eclipse.jface.text.ITextInputListener;
+import org.eclipse.jface.text.ITextOperationTarget;
+import org.eclipse.jface.text.ITextViewer;
+import org.eclipse.jface.text.ITextViewerExtension5;
+import org.eclipse.jface.text.TextViewer;
 import org.eclipse.swt.SWT;
-import org.eclipse.swt.custom.StyledText;
 import org.eclipse.swt.custom.CaretListener;
+import org.eclipse.swt.custom.StyledText;
 import org.eclipse.swt.graphics.Point;
-import org.eclipse.swt.widgets.*;
-import org.eclipse.ui.*;
+import org.eclipse.swt.widgets.Display;
+import org.eclipse.swt.widgets.Event;
+import org.eclipse.swt.widgets.IME;
+import org.eclipse.swt.widgets.Listener;
+import org.eclipse.swt.widgets.Shell;
+import org.eclipse.ui.IEditorPart;
+import org.eclipse.ui.IEditorReference;
+import org.eclipse.ui.IStartup;
+import org.eclipse.ui.IWorkbenchPage;
+import org.eclipse.ui.IWorkbenchWindow;
+import org.eclipse.ui.PlatformUI;
 import org.eclipse.ui.commands.ICommandService;
 
-/** One-character Korean IME recovery. No file or network logging. */
+/** 한글 IME에서 사라진 한 음절을 복원합니다. 파일이나 네트워크에는 기록하지 않습니다. */
 public final class KoreanImeFix implements IStartup, AutoCloseable {
     private static final String INSTALL_KEY = KoreanImeFix.class.getName();
-    private static final int[] FILTERS = {SWT.ImeComposition, SWT.KeyDown, SWT.MouseDown,
-        SWT.MouseUp, SWT.FocusIn, SWT.FocusOut, SWT.Deactivate};
+    private static final int RECOVERY_WINDOW_MILLIS = 1000;
+    private static final long RECOVERY_WINDOW_NANOS = 1_000_000_000L;
+    private static final int CONTEXT_LENGTH = 32;
+    private static final int SUPPORTED_COCOA_SWT_VERSION = 4974;
+    private static final int DIAGNOSTIC_LIMIT = 128;
+    private static final int[] FILTERS = { SWT.ImeComposition, SWT.KeyDown, SWT.MouseDown, SWT.MouseUp,
+            SWT.FocusIn, SWT.FocusOut, SWT.Deactivate };
+
     private final Map<StyledText, EditorState> editors = new IdentityHashMap<>();
     private final Map<IME, EditorState> imes = new IdentityHashMap<>();
     private final ArrayDeque<String> diagnostics = new ArrayDeque<>();
+
     private final Listener filter = this::dispatch;
     private final boolean trace = Boolean.getBoolean("koreanime.fix.trace");
+
     private Display display;
     private ICommandService commands;
     private boolean closed;
     private long inputSerial;
+
     private final IExecutionListener commandListener = new IExecutionListener() {
-        @Override public void preExecute(String id, ExecutionEvent event) {
-            if (isSmartEnter(id)) guarded(() -> {
-                EditorState s = focusedEditor();
-                if (s != null) {
-                    inputSerial++; s.receipt = null;
-                    note("smart-enter"); recover(s, Move.AFTER, null);
-                }
-            });
+        @Override
+        public void preExecute(String id, ExecutionEvent event) {
+            if (isSmartEnter(id)) {
+                guarded(() -> {
+                    EditorState state = trackFocusedEditor();
+                    if (state != null) {
+                        inputSerial++;
+                        state.receipt = null;
+                        note("smart-enter");
+                        restoreMissingCharacter(state, CaretMove.AFTER_RESTORED, null);
+                    }
+                });
+            }
         }
-        @Override public void postExecuteSuccess(String id, Object result) { }
-        @Override public void postExecuteFailure(String id, ExecutionException error) { }
-        @Override public void notHandled(String id, NotHandledException error) { }
+
+        @Override
+        public void postExecuteSuccess(String id, Object result) {}
+
+        @Override
+        public void postExecuteFailure(String id, ExecutionException error) {}
+
+        @Override
+        public void notHandled(String id, NotHandledException error) {}
     };
-    @Override public void earlyStartup() {
-        Display d = PlatformUI.getWorkbench().getDisplay();
-        d.asyncExec(() -> install(d, PlatformUI.getWorkbench().getService(ICommandService.class)));
+
+    @Override
+    public void earlyStartup() {
+        Display targetDisplay = PlatformUI.getWorkbench().getDisplay();
+        targetDisplay.asyncExec(
+                () -> install(targetDisplay, PlatformUI.getWorkbench().getService(ICommandService.class)));
     }
-    // Package-visible entry points also used by the isolated integration tests.
-    void install(Display d, ICommandService service) {
-        if (closed || d.isDisposed() || !"cocoa".equals(SWT.getPlatform())
-                || Boolean.getBoolean("koreanime.fix.disabled") || d.getData(INSTALL_KEY) != null) return;
-        display = d; commands = service; d.setData(INSTALL_KEY, this);
-        for (int kind : FILTERS) d.addFilter(kind, filter);
-        if (commands != null) commands.addExecutionListener(commandListener);
-        d.disposeExec(this::close);
-        focusedEditor(); note("installed");
+
+    // 독립된 통합 검사에서도 호출할 수 있도록 패키지 접근을 허용합니다.
+    void install(Display targetDisplay, ICommandService service) {
+        boolean shouldSkipInstallation = closed || targetDisplay.isDisposed()
+                || !"cocoa".equals(SWT.getPlatform()) || Boolean.getBoolean("koreanime.fix.disabled")
+                || targetDisplay.getData(INSTALL_KEY) != null;
+        if (shouldSkipInstallation) {
+            return;
+        }
+
+        display = targetDisplay;
+        commands = service;
+        targetDisplay.setData(INSTALL_KEY, this);
+
+        for (int kind : FILTERS) {
+            targetDisplay.addFilter(kind, filter);
+        }
+        if (commands != null) {
+            commands.addExecutionListener(commandListener);
+        }
+
+        targetDisplay.disposeExec(this::close);
+        trackFocusedEditor();
+        note("installed");
     }
-    private void dispatch(Event e) {
-        if (closed) return;
+
+    private void dispatch(Event event) {
+        if (closed) {
+            return;
+        }
+
         guarded(() -> {
-            switch (e.type) {
-                case SWT.ImeComposition -> onIme(e);
-                case SWT.FocusIn -> { if (e.widget instanceof StyledText st) state(st); }
-                case SWT.KeyDown -> onKey(e);
-                case SWT.MouseDown -> {
-                    inputSerial++;
-                    for (EditorState s : editors.values()) s.mouseDownSerial = inputSerial;
+            switch (event.type) {
+                case SWT.ImeComposition -> onIme(event);
+                case SWT.FocusIn -> {
+                    if (event.widget instanceof StyledText widget) {
+                        trackEditor(widget);
+                    }
                 }
-                case SWT.MouseUp -> onMouse(e);
+                case SWT.KeyDown -> onKey(event);
+                case SWT.MouseDown -> onMouseDown();
+                case SWT.MouseUp -> onMouseUp(event);
                 case SWT.FocusOut -> {
-                    if (e.widget instanceof StyledText st) {
-                        EditorState s = state(st); finishComposition(s); queueRecovery(s);
+                    if (event.widget instanceof StyledText widget) {
+                        finishOnFocusLoss(trackEditor(widget));
                     }
                 }
                 case SWT.Deactivate -> {
-                    if (e.widget instanceof Shell shell)
-                        for (EditorState s : editors.values())
-                            if (!s.widget.isDisposed() && s.widget.getShell() == shell) {
-                                finishComposition(s); queueRecovery(s);
-                            }
+                    if (event.widget instanceof Shell shell) {
+                        onShellDeactivated(shell);
+                    }
                 }
-                default -> { }
+                default -> {
+                }
             }
         });
     }
-    private EditorState focusedEditor() {
-        return display != null && display.getFocusControl() instanceof StyledText st ? state(st) : null;
-    }
-    private EditorState state(StyledText st) {
-        EditorState s = register(st);
-        if (s != null) attachViewer(s);
-        return s;
-    }
-    private EditorState register(StyledText st) {
-        if (st.isDisposed()) return null;
-        EditorState s = editors.get(st);
-        if (s == null) {
-            s = new EditorState(st); editors.put(st, s);
-            if (st.getIME() != null) imes.put(st.getIME(), s);
-            st.addListener(SWT.Dispose, s.disposeListener);
-            st.addListener(SWT.Modify, s.modifyListener);
-            st.addListener(SWT.Selection, s.selectionListener);
-            st.addCaretListener(s.caretListener);
+
+    private void onMouseDown() {
+        inputSerial++;
+        for (EditorState state : editors.values()) {
+            state.mouseDownSerial = inputSerial;
         }
-        return s;
     }
-    private void attachViewer(EditorState s) {
-        if (s.viewer != null && s.viewer.getTextWidget() == s.widget) {
-            bindViewer(s.widget, s.viewer);
+
+    private void onShellDeactivated(Shell shell) {
+        for (EditorState state : editors.values()) {
+            if (!state.widget.isDisposed() && state.widget.getShell() == shell) {
+                finishOnFocusLoss(state);
+            }
+        }
+    }
+
+    private void finishOnFocusLoss(EditorState state) {
+        finishNativeComposition(state);
+        queueRecoveryAudit(state);
+    }
+
+    private EditorState trackFocusedEditor() {
+        return display != null && display.getFocusControl() instanceof StyledText widget ? trackEditor(widget)
+                : null;
+    }
+
+    private EditorState trackEditor(StyledText widget) {
+        EditorState state = registerEditor(widget);
+        if (state != null) {
+            bindWorkbenchViewer(state);
+        }
+        return state;
+    }
+
+    private EditorState registerEditor(StyledText widget) {
+        if (widget.isDisposed()) {
+            return null;
+        }
+
+        EditorState state = editors.get(widget);
+        if (state == null) {
+            state = new EditorState(widget);
+            editors.put(widget, state);
+            if (widget.getIME() != null) {
+                imes.put(widget.getIME(), state);
+            }
+
+            widget.addListener(SWT.Dispose, state.disposeListener);
+            widget.addListener(SWT.Modify, state.modifyListener);
+            widget.addListener(SWT.Selection, state.selectionListener);
+            widget.addCaretListener(state.caretListener);
+        }
+        return state;
+    }
+
+    private void bindWorkbenchViewer(EditorState state) {
+        if (state.viewer != null && state.viewer.getTextWidget() == state.widget) {
+            bindViewer(state.widget, state.viewer);
             return;
         }
-        if (!PlatformUI.isWorkbenchRunning()) return;
-        for (IWorkbenchWindow window : PlatformUI.getWorkbench().getWorkbenchWindows())
-            for (IWorkbenchPage page : window.getPages())
+        if (!PlatformUI.isWorkbenchRunning()) {
+            return;
+        }
+
+        for (IWorkbenchWindow window : PlatformUI.getWorkbench().getWorkbenchWindows()) {
+            for (IWorkbenchPage page : window.getPages()) {
                 for (IEditorReference ref : page.getEditorReferences()) {
                     IEditorPart editor = ref.getEditor(false);
-                    if (editor == null) continue;
+                    if (editor == null) {
+                        continue;
+                    }
+
                     ITextOperationTarget target = editor.getAdapter(ITextOperationTarget.class);
-                    if (target instanceof ITextViewer viewer && viewer.getTextWidget() == s.widget) {
-                        bindViewer(s.widget, viewer); return;
+                    if (target instanceof ITextViewer viewer && viewer.getTextWidget() == state.widget) {
+                        bindViewer(state.widget, viewer);
+                        return;
                     }
                 }
-    }
-    void bindViewer(StyledText st, ITextViewer viewer) {
-        EditorState s = register(st);
-        if (s == null) return;
-        IDocument doc = viewer.getDocument();
-        if (s.viewer == viewer && s.document == doc) return;
-        if (s.document != null) s.document.removeDocumentListener(s.documentListener);
-        if (s.viewer != viewer) {
-            if (s.viewer != null) s.viewer.removeTextInputListener(s.inputListener);
-            viewer.addTextInputListener(s.inputListener);
+            }
         }
-        s.candidate = null; s.viewer = viewer; s.document = doc; s.revision++;
-        s.receipt = null;
-        if (doc != null) doc.addDocumentListener(s.documentListener);
+    }
+
+    void bindViewer(StyledText widget, ITextViewer viewer) {
+        EditorState state = registerEditor(widget);
+        if (state == null) {
+            return;
+        }
+
+        IDocument document = viewer.getDocument();
+        if (state.viewer == viewer && state.document == document) {
+            return;
+        }
+
+        if (state.document != null) {
+            state.document.removeDocumentListener(state.documentListener);
+        }
+        if (state.viewer != viewer) {
+            if (state.viewer != null) {
+                state.viewer.removeTextInputListener(state.inputListener);
+            }
+            viewer.addTextInputListener(state.inputListener);
+        }
+        state.candidate = null;
+        state.viewer = viewer;
+        state.document = document;
+        state.revision++;
+        state.receipt = null;
+        if (document != null) {
+            document.addDocumentListener(state.documentListener);
+        }
         note("document-bound");
     }
-    private void onIme(Event e) {
-        if (!(e.widget instanceof IME ime) || e.detail != SWT.COMPOSITION_CHANGED) return;
-        EditorState s = imes.get(ime);
-        if (s == null) {
-            EditorState focused = focusedEditor();
-            if (focused != null && focused.widget.getIME() == ime) s = focused;
+
+    private void onIme(Event event) {
+        if (!(event.widget instanceof IME ime) || event.detail != SWT.COMPOSITION_CHANGED) {
+            return;
         }
-        if (s == null || !eligible(s.widget)) return;
-        if (s.finishing && ime.getCommitCount() == 1 && e.text != null && e.text.equals(s.preedit)
-                && e.start == s.preeditStart && e.end == e.start + 1) {
-            // Let StyledText reset its composition caret, but remove zero
-            // characters: the displayed preedit is already the desired text.
-            // Returning false prevents Control from inserting the same text.
-            e.end = e.start; e.doit = false; return;
+        EditorState state = imes.get(ime);
+        if (state == null) {
+            EditorState focused = trackFocusedEditor();
+            if (focused != null && focused.widget.getIME() == ime) {
+                state = focused;
+            }
         }
-        attachViewer(s);
-        note("ime commit=" + ime.getCommitCount() + " length=" + (e.text == null ? -1 : e.text.length())
-            + " replaced=" + (e.end - e.start) + " focused=" + (display.getFocusControl() == s.widget)
-            + " kind=" + textKind(e.text));
-        s.lastImeTime = e.time; s.lastImeNanos = System.nanoTime();
-        if (e.text != null && !e.text.isEmpty()) s.lastHangul = isHangul(e.text.charAt(0));
-        s.candidate = null; s.receipt = null; s.session++;
-        String preedit = s.preedit; int preeditStart = s.preeditStart;
-        s.preedit = null; s.preeditStart = -1;
+        if (state == null || !isRecoveryAllowed(state.widget)) {
+            return;
+        }
+        boolean isFinishingDisplayedPreedit = state.finishing && ime.getCommitCount() == 1
+                && event.text != null && event.text.equals(state.preedit)
+                && event.start == state.preeditStart && event.end == event.start + 1;
+        if (isFinishingDisplayedPreedit) {
+            // 표시 중인 조합 문자를 보존하면서 StyledText가 조합 커서를 초기화하도록 합니다.
+            // 삭제 범위를 0으로 만들고, doit을 false로 설정해 같은 문자의 중복 삽입을 막습니다.
+            event.end = event.start;
+            event.doit = false;
+            return;
+        }
+
+        bindWorkbenchViewer(state);
+        note("ime commit=" + ime.getCommitCount() + " length="
+                + (event.text == null ? -1 : event.text.length()) + " replaced=" + (event.end - event.start)
+                + " focused=" + (display.getFocusControl() == state.widget) + " kind="
+                + textKind(event.text));
+
+        state.lastImeTime = event.time;
+        state.lastImeNanos = System.nanoTime();
+        if (event.text != null && !event.text.isEmpty()) {
+            state.lastHangul = isHangul(event.text.charAt(0));
+        }
+        state.candidate = null;
+        state.receipt = null;
+        state.session++;
+
+        String preedit = state.preedit;
+        int preeditStart = state.preeditStart;
+        state.preedit = null;
+        state.preeditStart = -1;
+
         if (ime.getCommitCount() == 0) {
-            if (e.text != null && e.text.length() == 1 && isHangul(e.text.charAt(0))) {
-                s.preedit = e.text; s.preeditStart = e.start;
+            boolean isSingleHangulPreedit = event.text != null && event.text.length() == 1
+                    && isHangul(event.text.charAt(0));
+            if (isSingleHangulPreedit) {
+                state.preedit = event.text;
+                state.preeditStart = event.start;
             }
             return;
         }
-        if (e.text == null || e.text.length() != 1 || ime.getCommitCount() != 1
-                || e.end - e.start != 1) return;
-        if (isHangul(e.text.charAt(0))) capture(s, e.time, e.start, e.text);
-        else if ((e.text.charAt(0) == SWT.CR || e.text.charAt(0) == SWT.LF)
-                && preedit != null && preeditStart == e.start
-                && e.start >= 0 && e.start < s.widget.getCharCount()
-                && s.widget.getTextRange(e.start, 1).equals(preedit)) {
-            // Cocoa can commit the Enter character over the still-marked
-            // Hangul after app switching. Preserve the observed preedit,
-            // while the native key path remains responsible for the newline.
-            note("enter-replaced-preedit"); capture(s, e.time, e.start, preedit);
+        boolean cannotCaptureCommit = event.text == null || event.text.length() != 1
+                || ime.getCommitCount() != 1 || event.end - event.start != 1;
+        if (cannotCaptureCommit) {
+            return;
+        }
+        if (isHangul(event.text.charAt(0))) {
+            captureRecoveryCandidate(state, event.time, event.start, event.text);
+            return;
+        }
+
+        boolean isEnterReplacingPreedit = (event.text.charAt(0) == SWT.CR || event.text.charAt(0) == SWT.LF)
+                && preedit != null && preeditStart == event.start && event.start >= 0
+                && event.start < state.widget.getCharCount()
+                && state.widget.getTextRange(event.start, 1).equals(preedit);
+        if (isEnterReplacingPreedit) {
+            // 앱 전환 후 Cocoa가 조합 중인 한글을 Enter 문자로 덮어쓸 수 있습니다.
+            // 확인한 조합 문자를 보존하고, 줄바꿈은 기존 네이티브 키 처리가 수행하도록 합니다.
+            note("enter-replaced-preedit");
+            captureRecoveryCandidate(state, event.time, event.start, preedit);
         }
     }
-    private void capture(EditorState s, int time, int start, String text) {
-        StyledText st = s.widget;
-        if (start < 0 || start >= st.getCharCount()) return;
-        String removed = st.getTextRange(start, 1);
-        if (!isHangul(removed.charAt(0))) return;
-        int modelStart = s.toModel(start);
-        if (s.document != null && (modelStart < 0 || modelStart >= s.document.getLength())) return;
-        int leftStart = Math.max(0, start - 32), rightLength = Math.min(32, st.getCharCount() - start - 1);
-        s.candidate = new Candidate(s.session, time, start, modelStart, st.getCharCount(),
-            inputSerial, removed, text, st.getTextRange(leftStart, start - leftStart),
-            st.getTextRange(start + 1, rightLength));
-        note("commit-candidate"); queueRecovery(s);
+
+    private void captureRecoveryCandidate(EditorState state, int time, int start, String text) {
+        StyledText widget = state.widget;
+        if (start < 0 || start >= widget.getCharCount()) {
+            return;
+        }
+
+        String removedText = widget.getTextRange(start, 1);
+        if (!isHangul(removedText.charAt(0))) {
+            return;
+        }
+
+        int modelStart = state.toModel(start);
+        boolean isOutsideDocument = state.document != null
+                && (modelStart < 0 || modelStart >= state.document.getLength());
+        if (isOutsideDocument) {
+            return;
+        }
+
+        int leftStart = Math.max(0, start - CONTEXT_LENGTH);
+        int rightLength = Math.min(CONTEXT_LENGTH, widget.getCharCount() - start - 1);
+        state.candidate = new RecoveryCandidate(state.session, time, start, modelStart, widget.getCharCount(),
+                inputSerial, removedText, text, widget.getTextRange(leftStart, start - leftStart),
+                widget.getTextRange(start + 1, rightLength));
+        note("commit-candidate");
+        queueRecoveryAudit(state);
     }
-    private void onKey(Event e) {
-        if (!(e.widget instanceof StyledText st)) return;
-        EditorState s = state(st);
-        if (s == null || isModifier(e.keyCode)) return;
+
+    private void onKey(Event event) {
+        if (!(event.widget instanceof StyledText widget)) {
+            return;
+        }
+        EditorState state = trackEditor(widget);
+        if (state == null || isModifier(event.keyCode)) {
+            return;
+        }
+
         inputSerial++;
-        s.receipt = null;
-        if (e.keyCode == SWT.BS && isHangul(e.character) && s.lastHangul
-                && e.time == s.lastImeTime && System.nanoTime() - s.lastImeNanos < 1_000_000_000L
-                && (e.stateMask & (SWT.COMMAND | SWT.CTRL | SWT.ALT)) == 0 && eligible(st)) {
-            s.candidate = null; e.doit = false; e.type = SWT.None;
-            note("duplicate-backspace-blocked"); return;
+        state.receipt = null;
+        if (isDuplicateBackspace(event, state)) {
+            state.candidate = null;
+            event.doit = false;
+            event.type = SWT.None;
+            note("duplicate-backspace-blocked");
+            return;
         }
-        Candidate c = s.candidate;
-        if (c == null) return;
-        note("pending-key kind=" + (isArrow(e.keyCode) ? "arrow" : e.keyCode == SWT.CR ? "enter" : "other") + " character=" + (isHangul(e.character) ? "hangul"
-            : e.character == SWT.CR ? "cr" : e.character == SWT.LF ? "lf" : "other")
-            + " modifiers=" + e.stateMask + " deleted=" + c.deleted);
-        if (!e.doit) { s.candidate = null; return; }
-        if (e.keyCode == SWT.ESC || e.keyCode == SWT.BS || e.keyCode == SWT.DEL) {
-            s.candidate = null; return;
+
+        RecoveryCandidate candidate = state.candidate;
+        if (candidate == null) {
+            return;
         }
-        if (isArrow(e.keyCode) && e.time == c.time && e.character == c.text.charAt(0))
-            recover(s, e.keyCode == SWT.ARROW_RIGHT ? Move.KEEP : Move.AFTER, null);
-        else if (e.character == SWT.CR || e.character == SWT.LF
-                || ((e.keyCode == SWT.CR || e.keyCode == SWT.KEYPAD_CR)
-                    && (e.character == 0 || (e.stateMask & SWT.SHIFT) != 0))) {
-            // A CR/LF event inserts a newline, not the Hangul removed by the
-            // preceding commit. Repair first. A plain Enter carrying Hangul
-            // remains the normal native re-insertion path below.
-            recover(s, Move.AFTER, null);
+        note("pending-key kind=" + keyKind(event.keyCode) + " character=" + characterKind(event.character)
+                + " modifiers=" + event.stateMask + " deleted=" + candidate.deleted);
+        if (!event.doit) {
+            state.candidate = null;
+            return;
         }
-        else if (!(isHangul(e.character) && e.character == c.text.charAt(0)
-                && e.time == c.time && (e.stateMask & SWT.MODIFIER_MASK) == 0))
-            s.candidate = null;
+        boolean cancelsRecovery = event.keyCode == SWT.ESC || event.keyCode == SWT.BS
+                || event.keyCode == SWT.DEL;
+        if (cancelsRecovery) {
+            state.candidate = null;
+            return;
+        }
+
+        boolean isArrowCommit = isArrow(event.keyCode) && event.time == candidate.time
+                && event.character == candidate.text.charAt(0);
+        if (isArrowCommit) {
+            CaretMove move = event.keyCode == SWT.ARROW_RIGHT ? CaretMove.BEFORE_RESTORED
+                    : CaretMove.AFTER_RESTORED;
+            restoreMissingCharacter(state, move, null);
+        } else if (isNewlineInput(event)) {
+            // 기존 네이티브 명령이 줄바꿈을 삽입하기 전에 문자를 복원합니다.
+            restoreMissingCharacter(state, CaretMove.AFTER_RESTORED, null);
+        } else if (!isNativeReinsertion(event, candidate)) {
+            state.candidate = null;
+        }
     }
-    private void onMouse(Event e) {
+
+    private static boolean isDuplicateBackspace(Event event, EditorState state) {
+        boolean isImeBackspace = event.keyCode == SWT.BS && isHangul(event.character) && state.lastHangul;
+        if (!isImeBackspace) {
+            return false;
+        }
+
+        boolean isRecentImeEvent = event.time == state.lastImeTime
+                && System.nanoTime() - state.lastImeNanos < RECOVERY_WINDOW_NANOS;
+        if (!isRecentImeEvent) {
+            return false;
+        }
+
+        boolean isPlainEditableBackspace = (event.stateMask & (SWT.COMMAND | SWT.CTRL | SWT.ALT)) == 0
+                && isRecoveryAllowed(state.widget);
+        return isPlainEditableBackspace;
+    }
+
+    private static boolean isNewlineInput(Event event) {
+        boolean hasNewlineCharacter = event.character == SWT.CR || event.character == SWT.LF;
+        if (hasNewlineCharacter) {
+            return true;
+        }
+
+        boolean isEnterCommit = (event.keyCode == SWT.CR || event.keyCode == SWT.KEYPAD_CR)
+                && (event.character == 0 || (event.stateMask & SWT.SHIFT) != 0);
+        return isEnterCommit;
+    }
+
+    private static boolean isNativeReinsertion(Event event, RecoveryCandidate candidate) {
+        boolean isSameCommittedCharacter = isHangul(event.character)
+                && event.character == candidate.text.charAt(0) && event.time == candidate.time;
+        return isSameCommittedCharacter && (event.stateMask & SWT.MODIFIER_MASK) == 0;
+    }
+
+    private void onMouseUp(Event event) {
         inputSerial++;
-        if (e.button != 1) return;
-        for (EditorState s : editors.values()) {
-            Receipt r = s.receipt;
-            s.receipt = null;
-            if (r != null && e.widget == s.widget && e.count <= 1
-                    && (e.stateMask & SWT.MODIFIER_MASK) == 0
-                    && s.session == r.session && s.revision == r.revision
-                    && s.selectionSerial == r.selectionSerial && inputSerial == r.inputSerial + 1
-                    && s.mouseDownSerial <= r.inputSerial && e.time - r.time >= 0 && e.time - r.time <= 1000
-                    && !s.widget.isDisposed() && display.getFocusControl() == s.widget) {
-                // The dispatch audit may have repaired the text before MouseUp.
-                // Preserve the click behavior when macOS consumed MouseDown.
-                int intended = offsetAtClick(s.widget, e.x, e.y);
-                if (intended >= 0) s.widget.setSelection(intended);
+        if (event.button != 1) {
+            return;
+        }
+
+        for (EditorState state : editors.values()) {
+            RecoveryReceipt receipt = state.receipt;
+            state.receipt = null;
+            if (canApplyClickAfterRecovery(event, state, receipt)) {
+                // 이벤트 처리 후 검사에서 MouseUp보다 먼저 문자를 복원했을 수 있습니다.
+                // macOS가 MouseDown을 소비한 경우에도 클릭한 위치로 커서를 이동합니다.
+                int intended = offsetAtClick(state.widget, event.x, event.y);
+                if (intended >= 0) {
+                    state.widget.setSelection(intended);
+                }
             }
-            Candidate c = s.candidate;
-            if (c == null || e.time - c.time < 0 || e.time - c.time > 1000) continue;
-            Point click = e.widget == s.widget && e.count <= 1
-                && (e.stateMask & SWT.MODIFIER_MASK) == 0 && s.mouseDownSerial <= c.inputSerial
-                ? new Point(e.x, e.y) : null;
-            recover(s, click != null ? Move.CLICK : Move.PRESERVE, click);
+
+            RecoveryCandidate candidate = state.candidate;
+            boolean isCandidateUnavailable = candidate == null || event.time - candidate.time < 0
+                    || event.time - candidate.time > RECOVERY_WINDOW_MILLIS;
+            if (isCandidateUnavailable) {
+                continue;
+            }
+
+            boolean isRecoveryClick = event.widget == state.widget && event.count <= 1
+                    && (event.stateMask & SWT.MODIFIER_MASK) == 0
+                    && state.mouseDownSerial <= candidate.inputSerial;
+            Point click = isRecoveryClick ? new Point(event.x, event.y) : null;
+            CaretMove move = click != null ? CaretMove.CLICKED_OFFSET : CaretMove.PRESERVE_POSITION;
+            restoreMissingCharacter(state, move, click);
         }
     }
-    private void queueRecovery(EditorState s) {
-        if (s == null || s.candidate == null || display.isDisposed()) return;
-        Candidate c = s.candidate;
-        if (c.queued) return;
-        c.queued = true;
+
+    private boolean canApplyClickAfterRecovery(Event event, EditorState state, RecoveryReceipt receipt) {
+        boolean isUnmodifiedSingleClick = receipt != null && event.widget == state.widget && event.count <= 1
+                && (event.stateMask & SWT.MODIFIER_MASK) == 0;
+        if (!isUnmodifiedSingleClick) {
+            return false;
+        }
+
+        boolean isCurrentReceipt = state.session == receipt.session && state.revision == receipt.revision
+                && state.selectionSerial == receipt.selectionSerial;
+        if (!isCurrentReceipt) {
+            return false;
+        }
+
+        boolean isNextMouseEvent = inputSerial == receipt.inputSerial + 1
+                && state.mouseDownSerial <= receipt.inputSerial;
+        if (!isNextMouseEvent) {
+            return false;
+        }
+
+        boolean isWithinRecoveryWindow = event.time - receipt.time >= 0
+                && event.time - receipt.time <= RECOVERY_WINDOW_MILLIS;
+        if (!isWithinRecoveryWindow) {
+            return false;
+        }
+
+        boolean canUseWidget = !state.widget.isDisposed() && display.getFocusControl() == state.widget;
+        return canUseWidget;
+    }
+
+    private void queueRecoveryAudit(EditorState state) {
+        boolean cannotQueueRecoveryAudit = state == null || state.candidate == null || display.isDisposed();
+        if (cannotQueueRecoveryAudit) {
+            return;
+        }
+        RecoveryCandidate candidate = state.candidate;
+        if (candidate.queued) {
+            return;
+        }
+        candidate.queued = true;
         display.asyncExec(() -> guarded(() -> {
-            if (closed || s.candidate != c || s.widget.isDisposed()) return;
-            c.queued = false;
-            // Native re-insertion occurs after the IME callback. Only audit
-            // documented editors with an exact deletion record after dispatch.
-            if (s.document != null) {
-                recover(s, Move.PRESERVE, null);
-                if (s.candidate == c) s.candidate = null;
+            boolean isStaleRecoveryAudit = closed || state.candidate != candidate || state.widget.isDisposed();
+            if (isStaleRecoveryAudit) {
+                return;
+            }
+            candidate.queued = false;
+            // 네이티브 문자 재삽입은 IME 콜백 뒤에 일어납니다.
+            // 문서와 연결된 편집기는 이벤트 처리 후 정확한 삭제 기록을 확인해 복원합니다.
+
+            if (state.document != null) {
+                restoreMissingCharacter(state, CaretMove.PRESERVE_POSITION, null);
+                if (state.candidate == candidate) {
+                    state.candidate = null;
+                }
             } else {
-                // Legacy MouseUp may be a later native event. Do not expire
-                // its candidate merely because asyncExec ran first.
-                display.timerExec(1000, () -> {
-                    if (s.candidate == c) s.candidate = null;
+                // 문서와 연결되지 않은 위젯은 네이티브 MouseUp이 나중에 도착할 수 있습니다.
+                // asyncExec가 먼저 실행됐다는 이유만으로 복원 후보를 폐기하지 않습니다.
+                display.timerExec(RECOVERY_WINDOW_MILLIS, () -> {
+                    if (state.candidate == candidate) {
+                        state.candidate = null;
+                    }
                 });
             }
         }));
     }
-    private void finishComposition(EditorState s) {
-        if (s == null || s.finishing || !eligible(s.widget) || s.preedit == null
-                || SWT.getVersion() != 4974) return;
-        StyledText st = s.widget; IME ime = st.getIME();
-        int start = s.preeditStart;
-        Point selection = st.getSelection();
-        if (ime == null || ime.getCommitCount() != 0 || ime.getCompositionOffset() != start
-                || !ime.getText().equals(s.preedit) || start < 0 || start >= st.getCharCount()
-                || !st.getTextRange(start, 1).equals(s.preedit) || selection.x != selection.y
-                || st.getSelectionRanges().length != 2) return;
-        int count = st.getCharCount(), caret = st.getCaretOffset();
-        String text = s.preedit;
-        s.candidate = null; s.receipt = null; s.finishing = true;
-        try {
-            if (!CocoaImeCommit.finish(st, text)) return;
-        } finally { s.finishing = false; }
-        if (ime.getCompositionOffset() == -1 && ime.getText().isEmpty()
-                && st.getCharCount() == count && st.getTextRange(start, 1).equals(text)) {
-            s.preedit = null; s.preeditStart = -1; s.session++;
-            st.setSelection(caret);
-            note("focus-composition-finished");
-        } else note("focus-composition-not-finished");
-    }
-    private enum Move { KEEP, AFTER, CLICK, PRESERVE }
-    private boolean recover(EditorState s, Move move, Point click) {
-        if (s.viewer != null && s.viewer.getDocument() != s.document) bindViewer(s.widget, s.viewer);
-        Candidate c = s.candidate;
-        if (c == null || s.restoring || !eligible(s.widget) || s.session != c.session) return false;
-        StyledText st = s.widget;
-        if (System.nanoTime() - s.lastImeNanos > 1_000_000_000L) { s.candidate = null; return false; }
-        if (s.document != null && (!c.deleted || c.invalid || s.revision != c.deletedRevision)) return false;
-        int start = s.document == null ? c.widgetStart : s.toWidget(c.modelStart);
-        if (start < 0 || start > st.getCharCount() || st.getCharCount() != c.oldCount - 1
-                || !sameContext(st, start, c, 0)) return false;
-        Point selection = st.getSelection(); int caret = st.getCaretOffset();
-        if (selection.x != selection.y || st.getSelectionRanges().length != 2) {
-            s.candidate = null; return false;
+
+    private void finishNativeComposition(EditorState state) {
+        boolean cannotFinishNativeComposition = state == null || state.finishing
+                || !isRecoveryAllowed(state.widget) || state.preedit == null
+                || SWT.getVersion() != SUPPORTED_COCOA_SWT_VERSION;
+        if (cannotFinishNativeComposition) {
+            return;
         }
-        long serial = inputSerial;
-        s.candidate = null; s.restoring = true;
-        boolean inserted;
+        StyledText widget = state.widget;
+        IME ime = widget.getIME();
+        int start = state.preeditStart;
+        Point selection = widget.getSelection();
+        boolean cannotCommitDisplayedPreedit = ime == null || ime.getCommitCount() != 0
+                || ime.getCompositionOffset() != start || !ime.getText().equals(state.preedit)
+                || start < 0 || start >= widget.getCharCount()
+                || !widget.getTextRange(start, 1).equals(state.preedit) || selection.x != selection.y
+                || widget.getSelectionRanges().length != 2;
+        if (cannotCommitDisplayedPreedit) {
+            return;
+        }
+
+        int count = widget.getCharCount();
+        int caret = widget.getCaretOffset();
+        String text = state.preedit;
+        state.candidate = null;
+        state.receipt = null;
+        state.finishing = true;
+
         try {
-            st.replaceTextRange(start, 0, c.text);
-            inserted = st.getCharCount() == c.oldCount && start < st.getCharCount()
-                && st.getTextRange(start, 1).equals(c.text) && sameContext(st, start, c, 1);
-        } finally { s.restoring = false; }
-        if (!inserted) { note("restore-rejected-or-transformed"); return false; }
-        note("restored");
-        if (move == Move.KEEP) st.setSelection(start);
-        else if (move == Move.AFTER) st.setSelection(start + 1);
-        else if (move == Move.PRESERVE)
-            st.setSelection(caret == start ? start + 1 : caret > start ? caret + 1 : caret);
-        else {
-            int intended = offsetAtClick(st, click.x, click.y);
-            st.setSelection(start + 1);
-            if (intended >= 0) {
-                long revision = s.revision, selectionSerial = s.selectionSerial;
-                display.asyncExec(() -> guarded(() -> {
-                    if (!closed && !st.isDisposed() && s.session == c.session
-                            && s.revision == revision && inputSerial == serial
-                            && s.selectionSerial == selectionSerial
-                            && display.getFocusControl() == st && intended <= st.getCharCount())
-                        st.setSelection(intended);
-                }));
+            if (!CocoaImeCommit.finish(widget, text)) {
+                return;
             }
+        } finally {
+            state.finishing = false;
         }
-        if (move == Move.PRESERVE)
-            s.receipt = new Receipt(c.session, c.time, s.revision, s.selectionSerial, inputSerial);
+        boolean isCompositionFinished = ime.getCompositionOffset() == -1 && ime.getText().isEmpty()
+                && widget.getCharCount() == count && widget.getTextRange(start, 1).equals(text);
+        if (isCompositionFinished) {
+            state.preedit = null;
+            state.preeditStart = -1;
+            state.session++;
+            widget.setSelection(caret);
+            note("focus-composition-finished");
+        } else {
+            note("focus-composition-not-finished");
+        }
+    }
+
+    private enum CaretMove {
+        BEFORE_RESTORED, AFTER_RESTORED, CLICKED_OFFSET, PRESERVE_POSITION
+    }
+
+    private boolean restoreMissingCharacter(EditorState state, CaretMove move, Point click) {
+        if (state.viewer != null && state.viewer.getDocument() != state.document) {
+            bindViewer(state.widget, state.viewer);
+        }
+        RecoveryCandidate candidate = state.candidate;
+        boolean cannotRestoreCandidate = candidate == null || state.restoring
+                || !isRecoveryAllowed(state.widget) || state.session != candidate.session;
+        if (cannotRestoreCandidate) {
+            return false;
+        }
+
+        StyledText widget = state.widget;
+        if (System.nanoTime() - state.lastImeNanos > RECOVERY_WINDOW_NANOS) {
+            state.candidate = null;
+            return false;
+        }
+        boolean hasConflictingDocumentChange = state.document != null
+                && (!candidate.deleted || candidate.invalid || state.revision != candidate.deletedRevision);
+        if (hasConflictingDocumentChange) {
+            return false;
+        }
+        int start = state.document == null ? candidate.widgetStart : state.toWidget(candidate.modelStart);
+        boolean hasUnexpectedDeletionContext = start < 0 || start > widget.getCharCount()
+                || widget.getCharCount() != candidate.originalCharCount - 1
+                || !hasMatchingContext(widget, start, candidate, 0);
+        if (hasUnexpectedDeletionContext) {
+            return false;
+        }
+
+        Point selection = widget.getSelection();
+        int caret = widget.getCaretOffset();
+        if (selection.x != selection.y || widget.getSelectionRanges().length != 2) {
+            state.candidate = null;
+            return false;
+        }
+
+        long serial = inputSerial;
+        state.candidate = null;
+        if (!insertRecoveryText(state, candidate, start)) {
+            note("restore-rejected-or-transformed");
+            return false;
+        }
+        note("restored");
+        moveCaretAfterRecovery(state, candidate, move, click, start, caret, serial);
+        if (move == CaretMove.PRESERVE_POSITION) {
+            state.receipt = new RecoveryReceipt(candidate.session, candidate.time, state.revision,
+                    state.selectionSerial, inputSerial);
+        }
         return true;
     }
-    private static boolean sameContext(StyledText st, int start, Candidate c, int inserted) {
-        return start >= c.left.length() && start + inserted + c.right.length() <= st.getCharCount()
-            && st.getTextRange(start - c.left.length(), c.left.length()).equals(c.left)
-            && st.getTextRange(start + inserted, c.right.length()).equals(c.right);
+
+    private static boolean insertRecoveryText(EditorState state, RecoveryCandidate candidate, int start) {
+        StyledText widget = state.widget;
+        state.restoring = true;
+        try {
+            widget.replaceTextRange(start, 0, candidate.text);
+            boolean restoredTextMatches = widget.getCharCount() == candidate.originalCharCount
+                    && start < widget.getCharCount() && widget.getTextRange(start, 1).equals(candidate.text)
+                    && hasMatchingContext(widget, start, candidate, 1);
+            return restoredTextMatches;
+        } finally {
+            state.restoring = false;
+        }
     }
+
+    private void moveCaretAfterRecovery(EditorState state, RecoveryCandidate candidate, CaretMove move,
+            Point click, int start, int caret, long serial) {
+        StyledText widget = state.widget;
+        switch (move) {
+            case BEFORE_RESTORED -> widget.setSelection(start);
+            case AFTER_RESTORED -> widget.setSelection(start + 1);
+            case PRESERVE_POSITION ->
+                widget.setSelection(caret == start ? start + 1 : caret > start ? caret + 1 : caret);
+            case CLICKED_OFFSET -> {
+                int intended = offsetAtClick(widget, click.x, click.y);
+                widget.setSelection(start + 1);
+                if (intended >= 0) {
+                    queueClickedCaret(state, candidate, intended, serial);
+                }
+            }
+        }
+    }
+
+    private void queueClickedCaret(EditorState state, RecoveryCandidate candidate, int intended,
+            long serial) {
+        StyledText widget = state.widget;
+        long revision = state.revision;
+        long selectionSerial = state.selectionSerial;
+        display.asyncExec(() -> guarded(() -> {
+            boolean canApplyQueuedClick = !closed && !widget.isDisposed()
+                    && state.session == candidate.session && state.revision == revision
+                    && inputSerial == serial && state.selectionSerial == selectionSerial
+                    && display.getFocusControl() == widget && intended <= widget.getCharCount();
+            if (canApplyQueuedClick) {
+                widget.setSelection(intended);
+            }
+        }));
+    }
+
+    private static boolean hasMatchingContext(StyledText widget, int start, RecoveryCandidate candidate,
+            int inserted) {
+        boolean hasContextBounds = start >= candidate.leftContext.length()
+                && start + inserted + candidate.rightContext.length() <= widget.getCharCount();
+        if (!hasContextBounds) {
+            return false;
+        }
+
+        boolean matchesLeftContext = widget.getTextRange(
+                start - candidate.leftContext.length(), candidate.leftContext.length())
+                .equals(candidate.leftContext);
+        if (!matchesLeftContext) {
+            return false;
+        }
+
+        boolean matchesRightContext = widget.getTextRange(start + inserted, candidate.rightContext.length())
+                .equals(candidate.rightContext);
+        return matchesRightContext;
+    }
+
     private final class EditorState {
         final StyledText widget;
-        ITextViewer viewer; IDocument document; Candidate candidate;
-        Receipt receipt;
-        long session, revision, selectionSerial, mouseDownSerial, lastImeNanos;
-        int lastImeTime; boolean restoring, lastHangul, finishing;
-        String preedit; int preeditStart = -1;
-        final Listener disposeListener = e -> detach(this);
-        final Listener modifyListener = e -> {
+        ITextViewer viewer;
+        IDocument document;
+        RecoveryCandidate candidate;
+        RecoveryReceipt receipt;
+        long session;
+        long revision;
+        long selectionSerial;
+        long mouseDownSerial;
+        long lastImeNanos;
+        int lastImeTime;
+        boolean restoring;
+        boolean lastHangul;
+        boolean finishing;
+        String preedit;
+        int preeditStart = -1;
+
+        final Listener disposeListener = event -> detach(this);
+        final Listener modifyListener = event -> {
             revision++;
-            if (!restoring) receipt = null;
-            if (!restoring && document == null) candidate = null;
+            if (!restoring) {
+                receipt = null;
+            }
+            if (!restoring && document == null) {
+                candidate = null;
+            }
         };
-        final Listener selectionListener = e -> selectionSerial++;
-        final CaretListener caretListener = e -> selectionSerial++;
+        final Listener selectionListener = event -> selectionSerial++;
+        final CaretListener caretListener = event -> selectionSerial++;
+
         final ITextInputListener inputListener = new ITextInputListener() {
-            @Override public void inputDocumentAboutToBeChanged(IDocument oldInput, IDocument newInput) {
-                candidate = null; receipt = null; preedit = null; preeditStart = -1; revision++;
-            }
-            @Override public void inputDocumentChanged(IDocument oldInput, IDocument newInput) {
-                if (viewer != null) bindViewer(widget, viewer);
-            }
-        };
-        final IDocumentListener documentListener = new IDocumentListener() {
-            @Override public void documentAboutToBeChanged(DocumentEvent e) {
-                Candidate c = candidate;
-                if (c == null || restoring) return;
-                try {
-                    if (!c.deleted && e.getDocument() == document && e.getOffset() == c.modelStart
-                            && e.getLength() == 1 && "".equals(e.getText())
-                            && document.get(e.getOffset(), 1).equals(c.removed)) c.deleted = true;
-                    else { c.invalid = true; candidate = null; }
-                } catch (BadLocationException ex) { candidate = null; note("document-range-invalid"); }
-            }
-            @Override public void documentChanged(DocumentEvent e) {
+            @Override
+            public void inputDocumentAboutToBeChanged(IDocument oldInput, IDocument newInput) {
+                candidate = null;
+                receipt = null;
+                preedit = null;
+                preeditStart = -1;
                 revision++;
-                if (!restoring) receipt = null;
-                if (candidate != null && candidate.deleted) candidate.deletedRevision = revision;
+            }
+
+            @Override
+            public void inputDocumentChanged(IDocument oldInput, IDocument newInput) {
+                if (viewer != null) {
+                    bindViewer(widget, viewer);
+                }
             }
         };
-        EditorState(StyledText st) { widget = st; }
+
+        final IDocumentListener documentListener = new IDocumentListener() {
+            @Override
+            public void documentAboutToBeChanged(DocumentEvent event) {
+                RecoveryCandidate pending = candidate;
+                if (pending == null || restoring) {
+                    return;
+                }
+
+                try {
+                    boolean isExpectedDeletion = !pending.deleted && event.getDocument() == document
+                            && event.getOffset() == pending.modelStart && event.getLength() == 1
+                            && "".equals(event.getText())
+                            && document.get(event.getOffset(), 1).equals(pending.removedText);
+                    if (isExpectedDeletion) {
+                        pending.deleted = true;
+                    } else {
+                        pending.invalid = true;
+                        candidate = null;
+                    }
+                } catch (BadLocationException error) {
+                    candidate = null;
+                    note("document-range-invalid");
+                }
+            }
+
+            @Override
+            public void documentChanged(DocumentEvent event) {
+                revision++;
+                if (!restoring) {
+                    receipt = null;
+                }
+                if (candidate != null && candidate.deleted) {
+                    candidate.deletedRevision = revision;
+                }
+            }
+        };
+
+        EditorState(StyledText widget) {
+            this.widget = widget;
+        }
+
         int toModel(int offset) {
-            if (viewer instanceof ITextViewerExtension5 ext) return ext.widgetOffset2ModelOffset(offset);
-            if (viewer instanceof TextViewer tv) return tv.widgetOffset2ModelOffset(offset);
+            if (viewer instanceof ITextViewerExtension5 ext) {
+                return ext.widgetOffset2ModelOffset(offset);
+            }
+            if (viewer instanceof TextViewer tv) {
+                return tv.widgetOffset2ModelOffset(offset);
+            }
             return viewer == null || viewer.getVisibleRegion().getOffset() == 0 ? offset : -1;
         }
+
         int toWidget(int offset) {
-            if (viewer instanceof ITextViewerExtension5 ext) return ext.modelOffset2WidgetOffset(offset);
-            if (viewer instanceof TextViewer tv) return tv.modelOffset2WidgetOffset(offset);
+            if (viewer instanceof ITextViewerExtension5 ext) {
+                return ext.modelOffset2WidgetOffset(offset);
+            }
+            if (viewer instanceof TextViewer tv) {
+                return tv.modelOffset2WidgetOffset(offset);
+            }
             return viewer == null || viewer.getVisibleRegion().getOffset() == 0 ? offset : -1;
         }
     }
-    private record Receipt(long session, int time, long revision, long selectionSerial, long inputSerial) { }
-    private static final class Candidate {
-        final long session, inputSerial;
-        final int time, widgetStart, modelStart, oldCount;
-        final String removed, text, left, right;
-        boolean deleted, invalid, queued; long deletedRevision;
-        Candidate(long session, int time, int widgetStart, int modelStart, int oldCount,
-                long inputSerial, String removed, String text, String left, String right) {
-            this.session = session; this.time = time; this.widgetStart = widgetStart;
-            this.modelStart = modelStart; this.oldCount = oldCount; this.inputSerial = inputSerial;
-            this.removed = removed; this.text = text; this.left = left; this.right = right;
+
+    private record RecoveryReceipt(long session, int time, long revision, long selectionSerial,
+            long inputSerial) {
+    }
+
+    private static final class RecoveryCandidate {
+        final long session;
+        final long inputSerial;
+        final int time;
+        final int widgetStart;
+        final int modelStart;
+        final int originalCharCount;
+        final String removedText;
+        final String text;
+        final String leftContext;
+        final String rightContext;
+        boolean deleted;
+        boolean invalid;
+        boolean queued;
+        long deletedRevision;
+
+        RecoveryCandidate(long session, int time, int widgetStart, int modelStart, int originalCharCount,
+                long inputSerial, String removedText, String text, String leftContext, String rightContext) {
+            this.session = session;
+            this.time = time;
+            this.widgetStart = widgetStart;
+            this.modelStart = modelStart;
+            this.originalCharCount = originalCharCount;
+            this.inputSerial = inputSerial;
+            this.removedText = removedText;
+            this.text = text;
+            this.leftContext = leftContext;
+            this.rightContext = rightContext;
         }
     }
-    private void detach(EditorState s) {
-        s.candidate = null;
-        s.receipt = null;
-        if (s.document != null) s.document.removeDocumentListener(s.documentListener);
-        if (s.viewer != null) s.viewer.removeTextInputListener(s.inputListener);
-        if (!s.widget.isDisposed()) {
-            s.widget.removeListener(SWT.Dispose, s.disposeListener);
-            s.widget.removeListener(SWT.Modify, s.modifyListener);
-            s.widget.removeListener(SWT.Selection, s.selectionListener);
-            s.widget.removeCaretListener(s.caretListener);
+
+    private void detach(EditorState state) {
+        state.candidate = null;
+        state.receipt = null;
+
+        if (state.document != null) {
+            state.document.removeDocumentListener(state.documentListener);
         }
-        editors.remove(s.widget); imes.values().removeIf(value -> value == s);
+        if (state.viewer != null) {
+            state.viewer.removeTextInputListener(state.inputListener);
+        }
+        if (!state.widget.isDisposed()) {
+            state.widget.removeListener(SWT.Dispose, state.disposeListener);
+            state.widget.removeListener(SWT.Modify, state.modifyListener);
+            state.widget.removeListener(SWT.Selection, state.selectionListener);
+            state.widget.removeCaretListener(state.caretListener);
+        }
+
+        editors.remove(state.widget);
+        imes.values().removeIf(value -> value == state);
     }
-    @Override public void close() {
-        if (closed) return;
+
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+
         closed = true;
-        if (commands != null) commands.removeExecutionListener(commandListener);
-        for (EditorState s : editors.values().toArray(EditorState[]::new)) detach(s);
-        editors.clear(); imes.clear();
-        if (display != null && !display.isDisposed()) {
-            for (int kind : FILTERS) display.removeFilter(kind, filter);
-            if (display.getData(INSTALL_KEY) == this) display.setData(INSTALL_KEY, null);
+
+        if (commands != null) {
+            commands.removeExecutionListener(commandListener);
         }
+
+        for (EditorState state : editors.values().toArray(EditorState[]::new)) {
+            detach(state);
+        }
+        editors.clear();
+        imes.clear();
+
+        if (display != null && !display.isDisposed()) {
+            for (int kind : FILTERS) {
+                display.removeFilter(kind, filter);
+            }
+
+            if (display.getData(INSTALL_KEY) == this) {
+                display.setData(INSTALL_KEY, null);
+            }
+        }
+
         diagnostics.clear();
     }
+
     private void guarded(Runnable action) {
-        try { action.run(); }
-        catch (RuntimeException error) { note("error:" + error.getClass().getSimpleName()); }
+        try {
+            action.run();
+        } catch (RuntimeException error) {
+            note("error:" + error.getClass().getSimpleName());
+        }
     }
+
     private void note(String message) {
-        if (!trace) return;
-        if (diagnostics.size() == 128) diagnostics.removeFirst();
+        if (!trace) {
+            return;
+        }
+        if (diagnostics.size() == DIAGNOSTIC_LIMIT) {
+            diagnostics.removeFirst();
+        }
         diagnostics.addLast(message);
-        System.out.println("KoreanImeFix " + message); // No text or file paths.
+        System.out.println("KoreanImeFix " + message); // 입력 내용과 파일 경로는 출력하지 않습니다.
     }
-    private static boolean eligible(StyledText st) {
-        return !st.isDisposed() && st.getEditable() && st.isEnabled() && !st.getBlockSelection();
+
+    private static boolean isRecoveryAllowed(StyledText widget) {
+        return !widget.isDisposed() && widget.getEditable() && widget.isEnabled()
+                && !widget.getBlockSelection();
     }
+
     private static boolean isSmartEnter(String id) {
-        return "org.eclipse.ui.edit.text.smartEnter".equals(id) || "org.eclipse.ui.edit.text.smartEnterInverse".equals(id);
+        return "org.eclipse.ui.edit.text.smartEnter".equals(id)
+                || "org.eclipse.ui.edit.text.smartEnterInverse".equals(id);
     }
-    private static boolean isModifier(int key) { return key == SWT.SHIFT || key == SWT.CTRL || key == SWT.ALT || key == SWT.COMMAND; }
-    private static boolean isArrow(int key) { return key == SWT.ARROW_LEFT || key == SWT.ARROW_RIGHT || key == SWT.ARROW_UP || key == SWT.ARROW_DOWN; }
-    private static boolean isHangul(char c) {
-        return (c >= 0x1100 && c <= 0x11FF) || (c >= 0x3130 && c <= 0x318F)
-            || (c >= 0xA960 && c <= 0xA97F) || (c >= 0xAC00 && c <= 0xD7A3) || (c >= 0xD7B0 && c <= 0xD7FF);
+
+    private static boolean isModifier(int key) {
+        return key == SWT.SHIFT || key == SWT.CTRL || key == SWT.ALT || key == SWT.COMMAND;
     }
+
+    private static boolean isArrow(int key) {
+        return key == SWT.ARROW_LEFT || key == SWT.ARROW_RIGHT || key == SWT.ARROW_UP
+                || key == SWT.ARROW_DOWN;
+    }
+
+    private static boolean isHangul(char character) {
+        return (character >= 0x1100 && character <= 0x11FF) || (character >= 0x3130 && character <= 0x318F)
+                || (character >= 0xA960 && character <= 0xA97F)
+                || (character >= 0xAC00 && character <= 0xD7A3)
+                || (character >= 0xD7B0 && character <= 0xD7FF);
+    }
+
+    private static String keyKind(int keyCode) {
+        return isArrow(keyCode) ? "arrow" : keyCode == SWT.CR ? "enter" : "other";
+    }
+
+    private static String characterKind(char character) {
+        return isHangul(character) ? "hangul"
+                : character == SWT.CR ? "cr" : character == SWT.LF ? "lf" : "other";
+    }
+
     private static String textKind(String text) {
-        if (text == null || text.isEmpty()) return "empty";
-        char c = text.charAt(0);
-        return isHangul(c) ? "hangul" : c == SWT.CR ? "cr" : c == SWT.LF ? "lf" : "other";
+        if (text == null || text.isEmpty()) {
+            return "empty";
+        }
+        return characterKind(text.charAt(0));
     }
-    private static int offsetAtClick(StyledText st, int x, int y) {
-        int offset = st.getOffsetAtPoint(new Point(x, y));
-        if (offset >= 0) return offset;
-        int line = st.getLineIndex(y);
-        if (line < 0 || line >= st.getLineCount()) return -1;
-        int start = st.getOffsetAtLine(line), end = start + st.getLine(line).length();
-        if (start == end) return start;
-        Point first = st.getLocationAtOffset(start), last = st.getLocationAtOffset(end);
-        if (first.y != last.y) return -1;
+
+    private static int offsetAtClick(StyledText widget, int x, int y) {
+        int offset = widget.getOffsetAtPoint(new Point(x, y));
+        if (offset >= 0) {
+            return offset;
+        }
+
+        int line = widget.getLineIndex(y);
+        if (line < 0 || line >= widget.getLineCount()) {
+            return -1;
+        }
+
+        int start = widget.getOffsetAtLine(line);
+        int end = start + widget.getLine(line).length();
+        if (start == end) {
+            return start;
+        }
+
+        Point first = widget.getLocationAtOffset(start);
+        Point last = widget.getLocationAtOffset(end);
+        if (first.y != last.y) {
+            return -1;
+        }
         return x <= first.x ? start : x >= last.x ? end : -1;
     }
 }

@@ -2,7 +2,7 @@ Manifest-Version: 1.0
 Bundle-ManifestVersion: 2
 Bundle-Name: Eclipse macOS Korean IME StyledText Fix
 Bundle-SymbolicName: eclipse.macos.koreanime.styledtext.fix;singleton:=true
-Bundle-Version: 1.0.0
+Bundle-Version: 1.0.1
 Bundle-ActivationPolicy: lazy
 Bundle-RequiredExecutionEnvironment: JavaSE-21
 Require-Bundle: org.eclipse.ui,org.eclipse.swt,org.eclipse.jface.text,
